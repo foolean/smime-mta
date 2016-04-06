@@ -1,0 +1,7 @@
+Build.PL
+etc/smime-mta.conf
+MANIFEST
+README
+ldapgetcert
+smime-mta
+smime-mta.conf.pod

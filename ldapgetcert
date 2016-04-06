@@ -1,0 +1,450 @@
+#!/usr/bin/perl -Tw
+#
+# FILENAME: ldapgetcert
+# AUTHOR:   Bennett Samowich <bennett@foolean.org>
+# DATE:     2016-03-18
+#
+# DESCRIPTION:
+#   This simple program will retrieve a SSL certificates from
+#   a LDAP directory.  It will output the cert in PEM format
+#   which can then be saved to a file or fed into openssl(1SSL)
+#   for further processing.
+#
+###############################################################################
+use strict;
+use warnings;
+
+use Crypt::OpenSSL::X509;
+use English qw( -no_match_vars );
+use File::Basename;
+use Getopt::Long qw(:config no_ignore_case);
+use Net::LDAPS;
+use Scalar::Util qw(tainted);
+use Sys::Syslog;
+
+# Our program name and version
+# Note: we may be dealing with multiple layers of symlinks so we
+#       will loop through iterations of 'readlink' until we have
+#       the actual file name.
+our $VERSION = '1.0.0';
+our $PROGRAM = __FILE__;
+while ( -l $PROGRAM ) {
+    $PROGRAM = readlink $PROGRAM;
+}
+$PROGRAM = basename($PROGRAM);
+
+# Miscellaneous variables and flags
+my $EMPTY_STRING = q{};    # Empty string macro for readability
+my $SYSLOG_OPEN  = 0;      # Flag to indicate if syslog is open
+
+# Options
+my %options = (
+    'help'          => 0,
+    'version'       => 0,
+    'debug'         => 0,
+    'ldap_uri'      => $EMPTY_STRING,
+    'ldap_base_dn'  => $EMPTY_STRING,
+    'ldap_verify'   => 'none',
+    'ldap_cafile'   => $EMPTY_STRING,
+    'ldap_capath'   => $EMPTY_STRING,
+    'ldap_timeout'  => '10',
+    'expiry_offset' => 0,
+    'user'          => $EMPTY_STRING,
+);
+
+# Argument specifications for Getopt::Long.
+my @arg_specs = qw(
+  ldap_base_dn|b=s
+  debug|d
+  expiry_offset|e=s
+  ldap_cafile|f=s
+  help|h
+  ldap_uri|H=s
+  ldap_capath|p=s
+  ldap_timeout|t=s
+  user|u=s
+  version|v
+  ldap_verify|V=s
+);
+
+# Parse the command-line options
+#Getopt::Long::Configure('bundling');
+GetOptions( \%options, @arg_specs );
+if ( $options{'help'} )    { usage();   exit 1; }
+if ( $options{'version'} ) { version(); exit 1; }
+
+# We must have the mail argument
+if ( $options{'user'} eq q{} ) {
+    error('must supply an email address');
+    usage();
+    exit 1;    # should never get here
+}
+
+$options{'ldap_uri'} = untaint_uri( $options{'ldap_uri'} );
+if ( !defined $options{'ldap_uri'} ) {
+    error('must supply a LDAP URI');
+    usage();
+    exit 1;    # should never get here
+}
+
+my $cert = ldap_get_cert( $options{'user'} );
+if ( defined $cert ) {
+    printf "%s\n", $cert;
+}
+
+exit 0;
+
+# get_cert($address) - Get certificate for an addresses from LDAP
+sub ldap_get_cert {
+    my $address = shift || return;
+    my $certificate;
+
+    if ( $options{'ldap_uri'} eq $EMPTY_STRING ) {
+        debug('skipping ldap certificate search');
+        return;
+    }
+
+    # Connect to the remote server
+    debug( 'connecting to %s', $options{'ldap_uri'} );
+    my $ldap = Net::LDAPS->new(
+        $options{'ldap_uri'},
+        verify  => $options{'ldap_verify'},
+        cafile  => $options{'ldap_cafile'},
+        capath  => $options{'ldap_capath'},
+        timeout => $options{'ldap_timeout'},
+        onerror => undef
+    );
+
+    # Determine if we were able to connect to the remote server
+    if ( !defined $ldap ) {
+        fatal( 'unable to connect to %s', $options{'ldap_uri'} );
+    }
+
+    # Bind to the remote server (anonymously)
+    my $bind_result = $ldap->bind();
+    if ( $bind_result->code != 0 ) {
+        fatal( 'unable to bind to server: %s', $bind_result->error );
+    }
+
+    # Get the PKI certificate for the address
+
+    # Search for the certificate
+    debug( 'searching ldap for %s', $address );
+    my $ldap_msg = $ldap->search(
+        base      => $options{'ldap_base_dn'},
+        filter    => "(|(mail=$address)(uid=$address))",
+        attrs     => ['userCertificate'],
+        sizelimit => 0,
+    );
+
+    # Process the results, if any
+    if ( $ldap_msg->code != 0 ) {
+        error( 'search for %s failed: %s', $address, $ldap_msg->error() );
+        return;
+    }
+
+    if ( $ldap_msg->count == 0 ) {
+        notice( 'no record retrieved for %s', $address );
+        return;
+    }
+
+    my $entry = $ldap_msg->entry(0);
+    if ( $entry->exists('userCertificate;binary') ) {
+
+        # Get the certificate as a Crypt::OpenSSL::X509 object
+        my $x509 = Crypt::OpenSSL::X509->new_from_string(
+            $entry->get_value('userCertificate;binary'),
+            Crypt::OpenSSL::X509::FORMAT_ASN1
+        );
+
+        # Make sure the certificate is not expired
+        if ( $x509->checkend( $options{'expiry_offset'} ) == 1 ) {
+            error( 'certificate for %s is expired', $address );
+        }
+
+        # Get the PEM formatted certificate
+        debug( 'loading PEM formatted certificate for %s', $address );
+        $certificate = $x509->as_string(Crypt::OpenSSL::X509::FORMAT_PEM);
+    }
+    else {
+        notice( 'no certificate found for %s', $address );
+    }
+
+    # Disconnect from the server
+    if ( defined $ldap ) {
+        $ldap->unbind();
+        $ldap->disconnect();
+    }
+
+    # Return the certificate
+    return $certificate;
+}
+
+# untaint_uri(URI) - untaint a LDAP URI
+sub untaint_uri {
+    my $uri = shift || return;
+
+    # No need to do anything if it's not tainted
+    if ( !tainted($uri) ) { return ($uri); }
+
+    # untaint the uri
+    if ( $uri =~ /^(ldap|ldaps):\/\/([\w\/\-\:.]+)$/smx ) {
+        return "$1://$2";
+    }
+    else {
+        fatal( 'Unable to untaint %s', $uri );
+    }
+
+    # Should never get here
+    return $uri;
+}
+
+# do_syslog($fmt, @args) - Handle the actual writing to syslog
+sub do_syslog {
+    my ( $fmt, @args ) = @_;
+
+    if ( $SYSLOG_OPEN == 0 ) {
+        openlog( $PROGRAM, 'pid', 'user' );
+        $SYSLOG_OPEN = 1;
+    }
+    syslog( 'info', $fmt, @args );
+
+    return;
+}
+
+# notice($fmt, @args) - Notice output handler
+sub notice {
+    my ( $fmt, @args ) = @_;
+
+    printf 'notice: ' . $fmt . "\n", @args;
+    if ( $options{'use_syslog'} ) {
+        do_syslog( 'notice: ' . $fmt, @args );
+    }
+
+    return;
+}
+
+# error($fmt, @args) - Error output handler
+sub error {
+    my ( $fmt, @args ) = @_;
+
+    printf {*STDERR} 'error: ' . $fmt . "\n", @args;
+    if ( $options{'use_syslog'} ) {
+        do_syslog( 'error: ' . $fmt, @args );
+    }
+
+    return;
+}
+
+# fatal($fmt, @args) - Fatal error output handler
+sub fatal {
+    my ( $fmt, @args ) = @_;
+
+    printf 'fatal: ' . $fmt . "\n", @args;
+    if ( $options{'use_syslog'} ) {
+        do_syslog( 'fatal: ' . $fmt, @args );
+    }
+    closelog();
+
+    exit 1;
+}
+
+# debug($fmt, @args) - Debug output handler
+sub debug {
+    my ( $fmt, @args ) = @_;
+
+    if ( $options{'debug'} ) {
+        printf {*STDERR} 'debug: ' . $fmt . "\n", @args;
+        if ( $options{'use_syslog'} ) {
+            do_syslog( 'debug: ' . $fmt, @args );
+        }
+    }
+
+    return;
+}
+
+# version - Standard version routine
+sub version {
+
+    printf "%s v%s\n", $PROGRAM, $VERSION;
+    return;
+}
+
+sub usage {
+
+    printf "\nusage: %s [OPTIONS]\n\n"
+      . "Where\n"
+      . "   -a, --ldap_base_dn [BASE]   - LDAP search base\n"
+      . "   -d, --debug                 - print debugging output\n"
+      . "   -f, --ldap_cafile [CAFILE]  - CA file to use\n"
+      . "   -h, --help                  - print this message\n"
+      . "   -H, --ldap_uri [URI]        - LDAP URI to connect to\n"
+      . "   -p, --ldap_capath [CAPATH]  - CA path to use\n"
+      . "   -u, --user [UID|MAIL]       - UID or email of user to get the certification for\n"
+      . "   -v, --version               - print version information\n"
+      . "   -V, --verify [LEVEL]        - Verification level\n", $PROGRAM;
+
+    exit 1;
+}
+
+__END__
+
+=head1 NAME
+
+ldapgetcert - Retrieve S/MIME certificate from a LDAP server
+
+=head1 SYNOPSIS
+
+ldapgetcert [ options ] 
+
+=head1 DESCRIPTION
+
+ldapgetcert is a simple program to retrieve a certificate from a remote
+LDAP server.  The certificate is output on the command-line in PEM format.
+
+=head1 OPTIONS
+
+ldapgetcert uses Getopt::Long to process command-line arguments, every
+option has a long option along with a short one.
+
+=over 6
+
+=item B<-b> BASEDN
+
+=item B<--ldap_base_dn> BASEDN
+
+Use BASEDN as the starting point for LDAP searches.
+
+=back
+
+=over 6
+
+=item B<-d>
+
+=item B<--debug>
+
+Print debugging output to STDERR
+
+=back
+
+=over 6
+
+=item B<-e> SECONDS
+
+=item B<--expiry_offset> SECONDS
+
+Specify the number of seconds of offset to use when calculating if the
+certificate is expired.  An error message will be sent to STDOUT if the
+certificate is determined to be expired.  The default is '0'.
+
+=back
+
+=over 6
+
+=item B<-f> CAFILE
+
+=item B<--ldap_cafile> CAFILE
+
+Use CAFILE as the file containing the Certificate Authority certificates
+
+=back
+
+=over 6
+
+=item B<-h>
+
+=item B<--help>
+
+Print usage information and exit.
+
+=back
+
+=over 6
+
+=item B<-H> URI
+
+=item B<--ldap_uri> URI
+
+Specify the URI for the remote LDAP server
+
+=back
+
+=over 6
+
+=item B<-p> CAPATH
+
+=item B<--ldap_capath> CAPATH
+
+Use CAPATH as the directory containing the Certificate Authority certificates.
+CAFILE will be use first if both CAFILE and CAPATH are specified.
+
+=back
+
+=over 6
+
+=item B<-t> SECONDS
+
+=item B<--timeout> SECONDS
+
+Specify the timeout, in seconds, to use when connecting to the remote LDAP
+server.
+
+=back
+
+=over 6
+
+=item B<-u> [UID|EMAIL]
+=item B<--user> [UID|EMAIL]
+
+Specify the uid number or email address for the user whom we are retrieving the certificate.
+
+=back
+
+=over 6
+
+=item B<-v>
+
+=item B<--version>
+
+Print version information and exit.
+
+=back
+
+=over 6
+
+=item B<-V> [none|optional|require]
+
+=item B<--verify> [none|optional|require]
+
+How to verify the server's certificate:
+
+=over 6
+
+=item B<none>
+
+The server may provide a certificate but it will not be checked - this may mean you are be connected to the wrong server
+
+=item B<optional>
+
+Verify only when the server offers a certificate
+
+=item B<require>
+
+The server must provide a certificate, and it must be valid.
+
+=back
+
+If you set verify to optional or require, you must also set either cafile or capath. The most secure option is require.
+
+=back
+
+=head1 BUGS AND LIMITATIONS
+
+None
+
+=head1 AUTHOR
+
+Bennett Samowich <bennett@foolean.org>
+
+=cut
+

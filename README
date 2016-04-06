@@ -1,0 +1,36 @@
+smime-mta - a S/MIME wrapper for the local MTA
+
+DESCRIPTION
+-----------
+
+smime-mta is a wrapper for the local MTA, typically ssmtp or sendmail, that
+ensures that all messages are encrypted using S/MIME.  The program will first
+look for certificates in the local cache.  Any missing certificates are
+retrieved from a remote LDAP server.
+
+INSTALLATION
+------------
+
+perl Build.PL
+./Build
+./Build install
+
+UNINSTALL
+---------
+
+./Build uninstall
+
+USAGE
+-----
+
+Typicall installations will create a symlink the local MTA to smime-mta.
+
+Example:
+    mv /usr/sbin/sendmail /usr/sbin/sendmail.real
+    ln -s /usr/local/sbin/smime-mta /usr/sbin/sendmail
+
+If you're using ssmtp then sendmail is already a symlink to ssmtp and just
+needs to be pointed at smime-mta.
+
+Once the MTA symlink is in place, configure the 'mta' option in smime-mta.conf
+to the full path to the real MTA (e.g. ssmpt or sendmail).

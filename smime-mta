@@ -1,0 +1,745 @@
+#!/usr/bin/perl -Tw
+#
+# FILENAME: smime-smtp
+# AUTHOR:   Bennett Samowich <bennett@foolean.org>
+# DATE:     2016-03-21
+#
+# DESCRIPTION:
+#
+###############################################################################
+use strict;
+use warnings;
+
+use Config::General qw(ParseConfig);
+use Crypt::OpenSSL::X509;
+use Crypt::SMIME;
+use Data::Dumper;
+use English qw( -no_match_vars );
+use File::Basename;
+use Getopt::Long qw(:config no_ignore_case);
+use IO::Select;
+use Mail::Internet;
+use Mail::ExpandAliases;
+use Net::Domain qw(hostdomain domainname);
+use Net::LDAPS;
+use Scalar::Util qw(tainted);
+use Sys::Syslog;
+
+# Our program name and version
+# Note: we may be dealing with multiple layers of symlinks so we
+#       will loop through iterations of 'readlink' until we have
+#       the actual file name.
+our $VERSION = '1.0.0';
+our $PROGRAM = __FILE__;
+while ( -l $PROGRAM ) {
+    $PROGRAM = readlink $PROGRAM;
+}
+$PROGRAM = basename($PROGRAM);
+my $USERNAME = getpwuid $UID;
+
+# Miscellaneous variables and flags
+my $ERR_FAIL     = '-1';    # Error code for failures
+my $EMPTY_STRING = q{};     # Empty string macro for readability
+my $SYSLOG_OPEN  = 0;       # Flag to indicate if syslog is open
+
+# Parse the configuration file
+my %config = load_config_file();
+
+# Options
+my %options = (
+    'always_encrypt_to' => $config{'always_encrypt_to'}   || (),
+    'mta'               => untaint_path( $config{'mta'} ) || '/usr/sbin/ssmtp',
+    'version'           => 0,
+    'debug'             => $config{'debug'}               || 0,
+    'use_syslog'        => $config{'use_syslog'}          || 1,
+    'ldap_uri'      => untaint_uri( $config{'ldap_uri'} ) || $EMPTY_STRING,
+    'ldap_base_dn'  => $config{'ldap_base_dn'}            || $EMPTY_STRING,
+    'ldap_verify'   => $config{'ldap_verify'}             || 'none',
+    'ldap_cafile'   => $config{'ldap_cafile'}             || $EMPTY_STRING,
+    'ldap_capath'   => $config{'ldap_capath'}             || $EMPTY_STRING,
+    'ldap_timeout'  => $config{'ldap_timeout'}            || '10',
+    'expiry_offset' => $config{'expiry_offset'}           || 0,
+    'cache_dir' => untaint_path( glob $config{'cache_dir'} )
+      || glob('~/.smime-mta'),
+);
+
+# Load the never_encrypt_to configuration into a hash
+foreach my $never ( @{ $config{'never_encrypt_to'} } ) {
+    $options{'never_encrypt_to'}{$never} = 1;
+}
+
+# Argument specifications for Getopt::Long.
+my @arg_specs = qw(
+  version|V
+);
+
+# Untaint and save ARGV
+# Note: We need to save the command-line arguments since we will be passing
+#       them through to the real MTA.  Because of this, they will also need
+#       to be untainted.  This is not the "right" way to untaint variables
+#       however it is all we can do since we can not predict the arguments
+#       that will be coming in, other than -V, since they technically belong
+#       to the real MTA we are passing things along to.
+my @ARGV_SAVE = ();
+foreach my $arg (@ARGV) {
+    if ( $arg =~ /(^.*)/smx ) {
+        my @members = expand_alias($1);
+        foreach my $member (@members) {
+            push @ARGV_SAVE, $member;
+        }
+    }
+}
+local @ARGV = @ARGV_SAVE;
+
+# Parse the command-line options
+# Note: We will be functioning as a passthrough to the real MTA configured in
+#       the 'mta' option.  Because of this, the only option that we really
+#       care about is the 'V' or 'version' flag.  All other options will be
+#       blindly passed to the real MTA.
+local $SIG{__WARN__} = sub { };    # Suppress warnings
+GetOptions( \%options, @arg_specs );
+if ( $options{'version'} ) { version(); exit 1; }
+
+# Debugging messages
+debug( 'mta               = [%s]', $options{'mta'} );
+debug( 'debug             = [%s]', $options{'debug'} );
+debug( 'use_syslog        = [%s]', $options{'use_syslog'} );
+debug( 'cache_dir         = [%s]', $options{'cache_dir'} );
+debug( 'ldap_uri          = [%s]', $options{'ldap_uri'} );
+debug( 'ldap_base_dn      = [%s]', $options{'ldap_base_dn'} );
+debug( 'ldap_verify       = [%s]', $options{'ldap_verify'} );
+debug( 'ldap_cafile       = [%s]', $options{'ldap_cafile'} );
+debug( 'ldap_capath       = [%s]', $options{'ldap_capath'} );
+debug( 'ldap_timeout      = [%s]', $options{'ldap_timeout'} );
+debug( 'expiry_offset     = [%s]', $options{'expiry_offset'} );
+debug( 'always_encrypt_to = [%s]',
+    join ', ', @{ $options{'always_encrypt_to'} } );
+
+# Just send the arguments if nothing is on stdin
+my $s = IO::Select->new();
+$s->add( \*STDIN );
+if ( !( $s->can_read(2) ) ) {
+    local $ENV{'PATH'} = qw{};
+    system $options{'mta'}, @ARGV_SAVE;
+    exit 0;
+}
+
+# Get the message from STDIN
+my $msg = do { local $INPUT_RECORD_SEPARATOR = undef; <STDIN> };
+
+# Expand any aliases in the message
+my @expanded_addresses;
+$msg = expand_aliases_in_message( $msg, \@expanded_addresses );
+
+# Get the list of recipients to encrypt to
+my @encrypt_to = get_encrypt_to( @ARGV, @expanded_addresses );
+debug( 'recipients        = [%s]', join ', ', @encrypt_to );
+
+# Encrypt the message
+my $encrypted = encrypt_message($msg);
+
+# Send the message up to the real MTA
+send_message($encrypted);
+
+# Close syslog and exit
+closelog();
+exit 0;
+
+# version - Standard version routine
+sub version {
+
+    printf '%s v%s', $PROGRAM, $VERSION;
+    if ( defined $options{'mta'} ) {
+        printf ' (wrapping %s in smime)', $options{'mta'};
+    }
+    printf "\n";
+    return;
+}
+
+# expand_alias - helper routine to expand an alias
+sub expand_alias {
+    my $address = shift || return;
+
+    my $aliases = Mail::ExpandAliases->new('/etc/aliases');
+
+    return $aliases->expand($address);
+}
+
+# expand_aliases_in_message - expand any aliases in a message
+sub expand_aliases_in_message {
+    my ( $message, $expanded_ref ) = @_;
+
+    my @lines = split /[\r|\n]/smx, $message;
+    my $mail  = Mail::Internet->new( \@lines );
+    my $head  = $mail->head->{'mail_hdr_list'};
+    my $body  = $mail->body();
+
+    my @new_head;    # placeholder for header with expanded aliases
+    my @new_body;    # placeholder for fixed up body
+
+    foreach my $line ( @{$head} ) {
+
+        # Expand aliases inline
+        if ( $line =~ /(^To: )/smx ) {
+            my ( $junk, $address ) = split q{ }, $line;
+
+            $address =~ s/\s+$//smx;    # strip trailing whitespace
+            $address =~ s/^\s+//smx;    # strip leading whitespace
+
+            # expand the aliases
+            my @members = expand_alias("$address");
+
+            # Add the expanded addresses back into the header
+            foreach my $member (@members) {
+
+                my $expanded_to_address = sprintf "To: %s\n", $member;
+                push @new_head, $expanded_to_address;
+
+                # ... also add the address to the list of expanded
+                # addresses for later certificate lookup
+                push @{$expanded_ref}, $member;
+            }
+        }
+        else {
+            push @new_head, $line;
+        }
+    }
+
+    # Add a newline to each of the body lines.
+    foreach my $line ( @{$body} ) {
+        push @new_body, $line . "\n";
+    }
+    $mail->header( \@new_head );
+    $mail->body( \@new_body );
+
+    # Get the new message with expanded aliases
+    my $new_message = $mail->as_string();
+
+    # Return the new message with expanded aliases and corrected CRLF
+    return $new_message;
+}
+
+# get_encrypt_to - Get the array of recpients to encrypt to
+sub get_encrypt_to {
+    my @ARGS = @_;
+
+    # Get the recipients
+    my @list = ();
+    foreach my $arg (@ARGS) {
+
+        # Accept recipient if it is in address@domain format
+        if ( $arg =~ /(\w{1}[-\w.]*)\@([-\w.]+)/smx ) {
+            if ( !exists $options{'never_encrypt_to'}{"$1\@$2"} ) {
+                push @list, "$1\@$2";
+            }
+            else {
+                debug( '%s is in never_encrypt_to list, skipping', "$1\@$2" );
+            }
+        }
+        elsif ( $arg =~ /(\w{1}[-\w.]*)/smx ) {
+            if ( !exists $options{'never_encrypt_to'}{$1} ) {
+                push @list, "$1";
+            }
+            else {
+                debug( '%s is in never_encrypt_to list, skipping', $1 );
+            }
+        }
+
+        # Strip the local system's domain
+        my $domain = domainname();
+        if ( $arg =~ /^(\w+)@\Q$domain/smx ) {
+            if ( !exists $options{'never_encrypt_to'}{$1} ) {
+                push @list, "$1";
+            }
+            else {
+                debug( '%s is in never_encrypt_to list, skipping', $1 );
+            }
+        }
+
+        # Net::Domain's domainname() often will produce
+        # the FQDN so we'll also try using hostdomain().
+        $domain = hostdomain();
+        if ( $arg =~ /^(\w+)@\Q$domain/smx ) {
+            if ( !exists $options{'never_encrypt_to'}{$1} ) {
+                push @list, "$1";
+            }
+            else {
+                debug( '%s is in never_encrypt_to list, skipping', $1 );
+            }
+        }
+
+    }
+
+    # Add the recipients to always encrypt to
+    foreach my $address ( @{ $config{'always_encrypt_to'} } ) {
+        push @list, $address;
+    }
+
+    # Remove duplicates
+    my %hash;
+    foreach my $address (@list) {
+        $hash{$address} = 1;
+    }
+    @list = keys %hash;
+
+    # Return the array of recipients
+    return @list;
+}
+
+# get_certs - Get certificates for an array of addresses.
+sub get_certs {
+    my @addresses = @_;
+    my @certs;
+    my @missing;
+
+    # Load certificates from the local cache
+    foreach my $address (@addresses) {
+        my $cert = read_cert($address);
+
+        # If we loaded the certificate...
+        if ( defined $cert ) {
+            if ( is_valid_cert($cert) ) {
+                debug( 'certificate for %s is good', $address );
+
+                # Save the cert in our array
+                push @certs, $cert;
+                next;    # Move on to the next address
+            }
+            debug( 'bad certificate for %s, will try from LDAP', $address );
+        }
+
+        # Add the address to the list of that
+        # will be searched for in LDAP
+        debug( 'adding %s to missing address list', $address );
+        push @missing, $address;
+    }
+
+    # Retrieve any certificates not in the local cache
+    if (@missing) {
+        my @missing_certs = ldap_get_certs(@missing);
+        foreach my $missing_cert (@missing_certs) {
+            push @certs, $missing_cert;
+        }
+    }
+
+    # Remove duplicates
+    my %hash;
+    foreach my $cert (@certs) {
+        $hash{$cert} = 1;
+    }
+    @certs = keys %hash;
+
+    # Return the array of certificates
+    return @certs;
+}
+
+# is_valid_cert - determine if a certificate should be considered expired
+sub is_valid_cert {
+    my $cert = shift || return 0;
+
+    # Get the certificate as a Crypt::OpenSSL::X509 object
+    my $x509 = Crypt::OpenSSL::X509->new_from_string($cert);
+
+    # Make sure the certificate is not expired
+    if ( $x509->checkend( $config{'expiry_offset'} ) != 1 ) {
+        return 1;    # certificate is not expired so it is good
+    }
+    return 0;        # certificate is not good, for whatever reason
+}
+
+# get_certs - Get certificates for an array of addresses from LDAP
+sub ldap_get_certs {
+    my @addresses = @_;
+    my @certs;
+
+    if ( $options{'ldap_uri'} eq $EMPTY_STRING ) {
+        debug('skipping ldap certificate search');
+        return @certs;
+    }
+
+    # Connect to the remote server
+    debug( 'connecting to %s', $options{'ldap_uri'} );
+    my $ldap = Net::LDAPS->new(
+        $options{'ldap_uri'},
+        verify  => $options{'ldap_verify'},
+        cafile  => $options{'ldap_cafile'},
+        capath  => $options{'ldap_capath'},
+        timeout => $options{'ldap_timeout'},
+        onerror => undef
+    );
+
+    # Determine if we were able to connect to the remote server
+    if ( !defined $ldap ) {
+        fatal( 'unable to connect to %s', $options{'ldap_uri'} );
+    }
+
+    # Bind to the remote server (anonymously)
+    my $bind_result = $ldap->bind();
+    if ( $bind_result->code != 0 ) {
+        fatal( 'unable to bind to server: %s', $bind_result->error );
+    }
+
+    # Get the PKI certificate for each address
+    foreach my $address (@addresses) {
+
+        # Search for the certificate
+        debug( 'searching ldap for %s', $address );
+        my $ldap_msg = $ldap->search(
+            base      => $options{'ldap_base_dn'},
+            filter    => "(|(mail=$address)(uid=$address))",
+            attrs     => ['userCertificate'],
+            sizelimit => 0,
+        );
+
+        # Process the results, if any
+        if ( $ldap_msg->code != 0 ) {
+            error( 'search for %s failed: %s', $address, $ldap_msg->error() );
+            next;
+        }
+
+        if ( $ldap_msg->count == 0 ) {
+            notice( 'no record retrieved for %s', $address );
+            next;
+        }
+
+        my $entry = $ldap_msg->entry(0);
+        if ( $entry->exists('userCertificate;binary') ) {
+
+            # Get the certificate as a Crypt::OpenSSL::X509 object
+            my $x509 = Crypt::OpenSSL::X509->new_from_string(
+                $entry->get_value('userCertificate;binary'),
+                Crypt::OpenSSL::X509::FORMAT_ASN1
+            );
+
+            # Make sure the certificate is not expired
+            if ( $x509->checkend( $config{'expiry_offset'} ) != 1 ) {
+
+                # Get the PEM formatted certificate
+                debug( 'loading PEM formatted certificate for %s', $address );
+                my $cert = $x509->as_string(Crypt::OpenSSL::X509::FORMAT_PEM);
+
+                # Save the cert in our array
+                push @certs, $cert;
+
+                # Save the cert in the local cache
+                save_cert( $address, $cert );
+            }
+            else {
+                error( 'certificate for %s is expired', $address );
+            }
+        }
+        else {
+            notice( 'no certificate found for %s', $address );
+        }
+
+    }
+
+    # Disconnect from the server
+    if ( defined $ldap ) {
+        $ldap->unbind();
+        $ldap->disconnect();
+    }
+
+    # Remove duplicates
+    my %hash;
+    foreach my $cert (@certs) {
+        $hash{$cert} = 1;
+    }
+    @certs = keys %hash;
+
+    # Return the array of certificates
+    return @certs;
+}
+
+# read_cert - Read a certificate from the cache
+sub read_cert {
+    my $address = shift || return;
+
+    # Assemble the full path to the cert
+    my $cert_path = sprintf '%s/%s.pem', $options{'cache_dir'}, $address;
+
+    if ( -e $cert_path ) {
+        my $is_open = open my $CERT, '< ', $cert_path;
+        if ($is_open) {
+            debug( 'loading %s', $cert_path );
+            my $cert = do { local $INPUT_RECORD_SEPARATOR = undef; <$CERT> };
+            close $CERT
+              or error( 'unable to close %s: %s', $cert_path, $OS_ERROR );
+
+            return $cert;
+        }
+        else {
+            error( 'unable to open certificate for %s: %s',
+                $address, $OS_ERROR );
+        }
+    }
+
+    return;
+}
+
+# save_cert - Save a certificate in the cache
+sub save_cert {
+    my ( $address, $cert ) = @_;
+
+    # Make sure the cache directory exists
+    if ( !-d $options{'cache_dir'} ) {
+        debug( 'creating cache directory: %s', $options{'cache_dir'} );
+        mkdir $options{'cache_dir'}, oct '0700';
+    }
+
+    # Assemble the full path to the cert
+    my $cert_path = sprintf '%s/%s.pem', $options{'cache_dir'}, $address;
+
+    # Save the certificate
+    my $is_open = open my $CERT, '>', $cert_path;
+    if ($is_open) {
+        debug( 'saving certificate to %s', $cert_path );
+        printf {$CERT} '%s', $cert;
+        close $CERT
+          or error( 'unable to close %s: %s', $cert_path, $OS_ERROR );
+    }
+    else {
+        error( 'unable to save certificate to %s: %s', $cert_path, $OS_ERROR );
+    }
+
+    return;
+}
+
+# do_syslog - Handle the actual writing to syslog
+sub do_syslog {
+    my ( $fmt, @args ) = @_;
+
+    if ( $SYSLOG_OPEN == 0 ) {
+        openlog( $PROGRAM, 'pid', 'user' );
+        $SYSLOG_OPEN = 1;
+    }
+    syslog( 'info', "($USERNAME) " . $fmt, @args );
+
+    return;
+}
+
+# notice - Notice output handler
+sub notice {
+    my ( $fmt, @args ) = @_;
+
+    printf {*STDERR} 'notice: ' . $fmt . "\n", @args;
+    if ( $options{'use_syslog'} ) {
+        do_syslog( 'notice: ' . $fmt, @args );
+    }
+
+    return;
+}
+
+# error - Error output handler
+sub error {
+    my ( $fmt, @args ) = @_;
+
+    printf {*STDERR} 'error: ' . $fmt . "\n", @args;
+    if ( $options{'use_syslog'} ) {
+        do_syslog( 'error: ' . $fmt, @args );
+    }
+
+    return;
+}
+
+# fatal - Fatal error output handler
+sub fatal {
+    my ( $fmt, @args ) = @_;
+
+    printf 'fatal: ' . $fmt . "\n", @args;
+    if ( $options{'use_syslog'} ) {
+        do_syslog( 'fatal: ' . $fmt, @args );
+    }
+    closelog();
+
+    exit 1;
+}
+
+# debug - Debug output handler
+sub debug {
+    my ( $fmt, @args ) = @_;
+
+    if ( $config{'debug'} ) {
+        printf {*STDERR} 'debug: ' . $fmt . "\n", @args;
+        if ( $options{'use_syslog'} ) {
+            do_syslog( 'debug: ' . $fmt, @args );
+        }
+    }
+
+    return;
+}
+
+# untaint_path - untaint a pathname
+sub untaint_path {
+    my $path = shift || return;
+
+    # No need to do anything if it's not tainted
+    if ( !tainted($path) ) { return ($path); }
+
+    # untaint the path
+    if ( $path =~ /^([~\w\/\-.]+)$/smx ) {
+        return ($1);
+    }
+    else {
+        fatal( 'Unable to untaint %s', $path );
+    }
+
+    # Should never get here
+    return $path;
+}
+
+# untaint_uri - untaint a LDAP URI
+sub untaint_uri {
+    my $uri = shift || return;
+
+    # No need to do anything if it's not tainted
+    if ( !tainted($uri) ) { return ($uri); }
+
+    # untaint the uri
+    if ( $uri =~ /^(ldap|ldaps):\/\/([\w\/\-\:.]+)$/smx ) {
+        return "$1://$2";
+    }
+    else {
+        fatal( 'Unable to untaint %s', $uri );
+    }
+
+    # Should never get here
+    return $uri;
+}
+
+# load_config_file - load the configuration file
+sub load_config_file {
+    my $CONFIG_FILE_NAME = 'smime-mta.conf';
+    my $CONFIG_FILE;
+
+    # Get the configuration file name
+    if ( -e "/etc/smime-mta/$CONFIG_FILE_NAME" ) {
+        $CONFIG_FILE = "/etc/smime-mta/$CONFIG_FILE_NAME";
+    }
+    elsif ( -e "/usr/local/etc/smime-mta/$CONFIG_FILE_NAME" ) {
+        $CONFIG_FILE = "/usr/local/etc/smime-mta/$CONFIG_FILE_NAME";
+    }
+    elsif ( -e "./$CONFIG_FILE_NAME" ) {
+        $CONFIG_FILE = "./$CONFIG_FILE_NAME";
+    }
+    else {
+        fatal('Unable to find configuration file');
+    }
+
+    # Load the configuration file
+    debug( 'reading configuration file: %s', $CONFIG_FILE );
+    my %hash = ParseConfig(
+        -ConfigFile => $CONFIG_FILE,
+        -AutoTrue   => 1,
+    );
+    if ( !%hash ) {
+        fatal( 'Unable to parse %s', $CONFIG_FILE );
+    }
+
+    # Return the configuration options
+    return %hash;
+}
+
+# encrypt_message - encrypt a message with S/MIME
+sub encrypt_message {
+    my $message = shift || return;
+
+    # See if the message needs encrypting
+    my $smime = Crypt::SMIME->new();
+    if ( !$smime->isEncrypted($message) ) {
+
+        # Get the PKI certs for the recipients
+        my @pubkeys = get_certs(@encrypt_to);
+        $smime->setPublicKey( \@pubkeys );
+
+        # Encrypt the message
+        debug('encrypting message');
+        return $smime->encrypt($message);
+    }
+    debug('message already encrypted with S/MIME, sending as-is');
+    return $message;
+}
+
+# send_message - send the message to the upstream MTA or STDOUT
+sub send_message {
+    my $data = shift || return;
+
+    my $MTA;
+    local $ENV{'PATH'} = $EMPTY_STRING;
+
+    # Open a pipe to the upstream MTA or STDOUT
+    ## no critic (RequireBriefOpen)
+    if ( $options{'mta'} =~ /stdout/smix ) {
+        debug('opening pipe to STDOUT');
+        open $MTA, '>& STDOUT'
+          or fatal( 'Unable to open pipe to STDOUT: %s', $OS_ERROR );
+    }
+    else {
+        my $pipe = sprintf '%s %s', $options{'mta'}, join q{ }, @ARGV_SAVE;
+        debug( 'opening pipe to %s', $pipe );
+        open $MTA, q{|-}, $pipe
+          or fatal( 'Unable to open pipe to mta(%s): %s',
+            $options{'mta'}, $OS_ERROR );
+    }
+
+    # Send the message to the MTA
+    debug('sending message to pipe');
+    printf {$MTA} '%s', $data;
+
+    # Close the pipe to the MTA
+    debug('closing pipe');
+    close $MTA
+      or
+      fatal( 'Unable to close pipe to %s: %s', "$options{'mta'}", $OS_ERROR );
+    ## use critic
+
+    return;
+}
+
+__END__
+
+=head1 NAME
+
+smime-mta - S/MIME MTA wrapper
+
+=head1 SYNOPSIS
+
+smime-mta [ flags ] [ address ... ]
+
+=head1 DESCRIPTION
+
+smime-mta is a wrapper for the local MTA, typically ssmtp or sendmail,
+that ensures that all messages are encrypted using S/MIME.  The program
+will retrieve remote certificates from a remote LDAP server.
+
+=head1 OPTIONS
+
+Most options are passed through to the actual MTA and thus are ignored by
+smime-mta.
+
+=over 6
+
+=item B<-V>
+
+Output version information and quit.
+
+=back
+
+=head1 FILES
+
+/etc/smime-mta/smime-mta.conf - primary configuration file
+
+=head1 SEE ALSO
+
+smime-mta.conf(5), ssmtp(8), sendmail, RFC821, RFC822
+
+=head1 BUGS AND LIMITATIONS
+
+smime-mta does not spool messages that do not have any recipient certificates.
+
+=head1 AUTHOR
+
+Bennett Samowich <bennett@foolean.org>
+
+=cut
+

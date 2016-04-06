@@ -1,0 +1,128 @@
+=head1 NAME
+
+smime-mta.conf - smime-mta configuration file
+
+=head1 SYNOPSIS
+
+/etc/smime-mta/smime-mta.conf
+
+=head1 DESCRIPTION
+
+smime-mta(1) reads configuration data from /etc/smime-mta/smime-mta.conf.  The file contains keyword-argument pairs, one per line.  Lines starting with '#' and empty lines are interpreted as comments.  Arguments may optionally be enclosed in double quotes (") in order to represent arguments containing spaces.
+
+=head1 OPTIONS
+
+=over 6
+
+=item B<cache_dir> [path]
+
+Path to the directory where cached copies of the certificates will be
+stored.
+
+default: ~/.smime-mta
+
+=item B<mta> [path]
+
+Path to the MTA binary that smime-mta(1) will use to send the message.
+Typically smime-mta(1) will be used as a wrapper for this MTA.  Use
+'stdout' to send the encrypted message to STDOUT instead of the MTA.
+
+=item B<debug> [true|false]
+
+Toggle debugging output
+
+default: false
+
+=item B<use_syslog> [true|false]
+
+Toggle the sending of logging output to syslog.  Only informational output as
+well as error and debug messages will be sent to syslog.  TThe message itself
+will not be sent to syslog.
+
+default: true
+
+=item B<expiry_offset> [integer]
+
+The offset, in seconds, to use when determining if a certificate should be
+considered as expired.  For example; using the value 3600 will declare any
+certificate that will expire within 1 hour (3600 seconds) from now.  This is
+useful if the desire is to only encrypt with certificates that have a lifespan
+long enough for the message to be read.  However, this can also leave a
+message with no possible certificate for encryption.
+
+default: 0
+
+=item B<always_encrypt_to> [address|uid]
+
+Addresses or usernames to encrypt the messages to.  This option may be
+specified multiple times.
+
+=item B<never_encrypt_to> [address|uid]
+
+Exclude addresses or usernames from encryption and certificate lookup.  This
+option may be specified multiple times.
+
+=item B<ldap_uri> [uri]
+
+The URI for connecting to the LDAP server that holds the certificates.
+
+Commenting out ldap_uri or setting it to blank will cause LDAP certificate
+searches to be skipped.
+
+=item B<ldap_base_dn> [dn]
+
+The base DN for searching the LDAP server for certificates.
+
+=item B<ldap_timeout> [integer]
+
+Timeout, in seconds, for connecting to the LDAP server.
+
+default: 10
+
+=item B<ldap_verify> [none|optional|require]
+
+How to verify the LDAP server's certificate.
+
+=over 6
+
+=item B<none>
+
+The server may provide a certificate but it will not be checked - this may
+mean you are be connected to the wrong server.
+
+=item B<optional>
+
+Verify only when the server offers a certificate.
+
+=item B<require>
+
+The server must provide a certificate, and it must be valid.
+
+=back
+
+If you set verify to optional or require, you must also set either cafile or
+capath. The most secure option is require.
+
+default: none
+
+=item B<ldap_capath> [path]
+
+=item B<ldap_cafile> [filename]
+
+When verifying the server's certificate, either set capath to the pathname of
+the directory containing CA certificates, or set cafile to the filename
+containing the certificate of the CA who signed the server's certificate.
+These certificates must all be in PEM format.
+              
+The directory in 'capath' must contain certificates named using the hash value
+of the certificates'.
+
+=back
+
+=head1 AUTHOR
+
+Bennett Samowich <bennett@foolean.org>
+
+=head1 SEE ALSO
+
+smime-mta(1)
