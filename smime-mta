@@ -47,9 +47,10 @@ my %config = load_config_file();
 
 # Options
 my %options = (
+    'version'           => 0,
     'always_encrypt_to' => $config{'always_encrypt_to'}   || (),
     'mta'               => untaint_path( $config{'mta'} ) || '/usr/sbin/ssmtp',
-    'version'           => 0,
+    'keep_aliases'      => $config{'keep_aliases'}        || 0,
     'debug'             => $config{'debug'}               || 0,
     'use_syslog'        => $config{'use_syslog'}          || 1,
     'ldap_uri'      => untaint_uri( $config{'ldap_uri'} ) || $EMPTY_STRING,
