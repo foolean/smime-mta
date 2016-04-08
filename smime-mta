@@ -180,7 +180,8 @@ sub expand_aliases_in_message {
     foreach my $line ( @{$head} ) {
 
         # Expand aliases inline
-        if ( $line =~ /(^To: )/smx ) {
+        if ( $line =~ /^(To|Cc|Bcc):[ ]/smx ) {
+            $header_type = $1;  # capture the header type (e.g. To, Cc, Bcc)
             my ( $junk, $address ) = split q{ }, $line;
 
             $address =~ s/\s+$//smx;    # strip trailing whitespace
@@ -189,11 +190,29 @@ sub expand_aliases_in_message {
             # expand the aliases
             my @members = expand_alias("$address");
 
+            # We will want to handle things differently if we have an alias.
+            # In order to not expose the recipients we will Bcc the expanded
+            # addresses.  We must also consider that ssmtp doesn't understand
+            # aliases so we will drop the alias from the header when ssmtp is
+            # being used as the real MTA.
+            my $is_alias = 0;
+            if ( $members[0] ne $address ) {
+                $is_alias = 1;
+                if ( $options{'keep_aliases'} == 1 ) {
+                    push @new_head, $line;
+                }
+            }
+
             # Add the expanded addresses back into the header
             foreach my $member (@members) {
 
-                my $expanded_to_address = sprintf "To: %s\n", $member;
-                push @new_head, $expanded_to_address;
+                # If we're not keeping the alias then we will need
+                # to add the expanded addresses as Bcc headers to
+                # avoid accidentally exposing the real recipient list.
+                if ( $options{'keep_aliases'} == 0 ) {
+                    my $expanded_to_address = sprintf "Bcc: %s\n", $member;
+                    push @new_head, $expanded_to_address;
+                }
 
                 # ... also add the address to the list of expanded
                 # addresses for later certificate lookup
@@ -736,6 +755,9 @@ smime-mta.conf(5), ssmtp(8), sendmail, RFC821, RFC822
 =head1 BUGS AND LIMITATIONS
 
 smime-mta does not spool messages that do not have any recipient certificates.
+
+smime-mta does not attempt to parse or rewrite MTA arguments passed to it from
+the client.
 
 =head1 AUTHOR
 

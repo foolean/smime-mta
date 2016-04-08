@@ -8,6 +8,7 @@ ensures that all messages are encrypted using S/MIME.  The program will first
 look for certificates in the local cache.  Any missing certificates are
 retrieved from a remote LDAP server.
 
+
 INSTALLATION
 ------------
 
@@ -15,10 +16,12 @@ perl Build.PL
 ./Build
 ./Build install
 
+
 UNINSTALL
 ---------
 
 ./Build uninstall
+
 
 USAGE
 -----
@@ -34,3 +37,39 @@ needs to be pointed at smime-mta.
 
 Once the MTA symlink is in place, configure the 'mta' option in smime-mta.conf
 to the full path to the real MTA (e.g. ssmpt or sendmail).
+
+
+ALIAS EXPANSION
+---------------
+
+Some MTAs, such as ssmtp, do not understand aliases and some applications
+require aliases to function properly.  Since we are encrypting messages on the
+fly we must expand aliases into the list of actual users, if no other reason
+than ensuring the highest probability that we will be able to find a
+certifcate for the recipients.  smime-mta will perform alias expansion but
+that introduces the possibility that the real MTA may not understand them.
+Additionally, smime-mta makes no attempt to parse or rewrite the arguments
+passed to it by the client.  This all means that a decision must be made on
+what to do with the alias recipient header itself.  The 'keep_aliases'
+configuration option is the current answer (ok, it's a punt).  This option
+will instruct smime-mta as to whether or not the alias should be kept in the
+headers.
+
+If you are using aliases, a real MTA that doesn't understand them, and have
+set 'keep_aliases' to 'false'.  Recipients will receive the encrypted message
+without the 'To:' or 'Cc:' header that contained the alias.
+
+Example:
+    echo "test" | mailx -s "testing" some-alias
+
+will typically result in:
+
+    From: you@yourdomain
+    To: undisclosed-recipients:;
+    Subject: testing
+
+    test
+
+There is probably a better way to deal with this but it would most likely
+result in the need for parsing and manipulating the arguments passed by the
+client.

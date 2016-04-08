@@ -27,6 +27,14 @@ Path to the MTA binary that smime-mta(1) will use to send the message.
 Typically smime-mta(1) will be used as a wrapper for this MTA.  Use
 'stdout' to send the encrypted message to STDOUT instead of the MTA.
 
+=item B<keep_aliases> [true|false]
+
+Some MTAs don't understand aliases however some software relies on aliases
+for functionality.  keep_aliases tells smime-mta to keep or drop the alias
+from the headers.
+
+default: false
+
 =item B<debug> [true|false]
 
 Toggle debugging output
