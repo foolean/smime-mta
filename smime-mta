@@ -182,7 +182,7 @@ sub expand_aliases_in_message {
 
         # Expand aliases inline
         if ( $line =~ /^(To|Cc|Bcc):[ ]/smx ) {
-            $header_type = $1;  # capture the header type (e.g. To, Cc, Bcc)
+            my $header_type = $1;  # capture the header type (e.g. To, Cc, Bcc)
             my ( $junk, $address ) = split q{ }, $line;
 
             $address =~ s/\s+$//smx;    # strip trailing whitespace
