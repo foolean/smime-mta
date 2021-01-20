@@ -105,6 +105,7 @@ if ( $options{'version'} ) { version(); exit 1; }
 debug( 'mta               = [%s]', $options{'mta'} );
 debug( 'debug             = [%s]', $options{'debug'} );
 debug( 'use_syslog        = [%s]', $options{'use_syslog'} );
+debug( 'keep_aliases      = [%s]', $options{'keep_aliases'} );
 debug( 'cache_dir         = [%s]', $options{'cache_dir'} );
 debug( 'ldap_uri          = [%s]', $options{'ldap_uri'} );
 debug( 'ldap_base_dn      = [%s]', $options{'ldap_base_dn'} );
@@ -196,12 +197,8 @@ sub expand_aliases_in_message {
             # addresses.  We must also consider that ssmtp doesn't understand
             # aliases so we will drop the alias from the header when ssmtp is
             # being used as the real MTA.
-            my $is_alias = 0;
-            if ( $members[0] ne $address ) {
-                $is_alias = 1;
-                if ( $options{'keep_aliases'} == 1 ) {
-                    push @new_head, $line;
-                }
+            if ( ( $members[0] == $address ) || ( $options{'keep_aliases'} == 1 ) ) {
+                push @new_head, $line;
             }
 
             # Add the expanded addresses back into the header
